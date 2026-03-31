@@ -2,7 +2,7 @@
   "name": "Registro de Asistencia - Centro Escolar INSA",
   "short_name": "Asistencia INSA",
   "description": "Sistema de registro y control de asistencia escolar",
-  "start_url": "/Asistencia-INS/",
+  "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait-primary",
   "background_color": "#1e3a5f",
@@ -10,52 +10,52 @@
   "categories": ["education", "productivity"],
   "lang": "es-SV",
   "dir": "ltr",
-  "scope": "/Asistencia-INS/",
+  "scope": "./",
   "icons": [
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-72x72.png",
+      "src": "icons/icon-72x72.png",
       "sizes": "72x72",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-96x96.png",
+      "src": "icons/icon-96x96.png",
       "sizes": "96x96",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-128x128.png",
+      "src": "icons/icon-128x128.png",
       "sizes": "128x128",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-144x144.png",
+      "src": "icons/icon-144x144.png",
       "sizes": "144x144",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-152x152.png",
+      "src": "icons/icon-152x152.png",
       "sizes": "152x152",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-192x192.png",
+      "src": "icons/icon-192x192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-384x384.png",
+      "src": "icons/icon-384x384.png",
       "sizes": "384x384",
       "type": "image/png",
       "purpose": "any maskable"
     },
     {
-      "src": "/Asistencia-INS/pwa/icons/icon-512x512.png",
+      "src": "icons/icon-512x512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any maskable"
@@ -66,15 +66,15 @@
       "name": "Pasar Lista",
       "short_name": "Lista",
       "description": "Ir directamente a pasar lista",
-      "url": "/Asistencia-INS/?action=lista",
-      "icons": [{ "src": "/Asistencia-INS/pwa/icons/icon-96x96.png", "sizes": "96x96" }]
+      "url": "./index.html?action=lista",
+      "icons": [{ "src": "icons/icon-96x96.png", "sizes": "96x96" }]
     },
     {
       "name": "Ver Reportes",
       "short_name": "Reportes",
       "description": "Ver reportes de asistencia",
-      "url": "/Asistencia-INS/?action=reporte",
-      "icons": [{ "src": "/Asistencia-INS/pwa/icons/icon-96x96.png", "sizes": "96x96" }]
+      "url": "./index.html?action=reporte",
+      "icons": [{ "src": "icons/icon-96x96.png", "sizes": "96x96" }]
     }
   ]
 }

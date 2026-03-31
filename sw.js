@@ -1,10 +1,10 @@
-const CACHE = 'asistencia-v1';
+const CACHE = 'asistencia-v2'; // v2: Importador Google Meet PDF mejorado
 
 // Instalar: cachea la app inmediatamente
 self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE)
-      .then(c => c.add('./'))
+      .then(c => c.addAll(['./', './index.html']))
       .then(() => self.skipWaiting())
   );
 });
@@ -22,6 +22,9 @@ self.addEventListener('activate', e => {
 
 // Fetch: red primero, actualiza caché, fallback offline
 self.addEventListener('fetch', e => {
+  // Solo cachear requests GET
+  if(e.request.method !== 'GET') return;
+
   e.respondWith(
     fetch(e.request)
       .then(res => {

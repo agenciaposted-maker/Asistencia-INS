@@ -2847,27 +2847,39 @@ function importarMeet(input){
       reader.onload = async e=>{
         try{
           let niesList = [];
+          let namesList = []; // Lista de nombres extraídos
           const _emailRe = /[\w.\-+]+@[\w.\-]+\.\w{2,}/gi;
-          let pdfNamesForDetect = [];
+
           if(isExcel){
             const wb = XLSX.read(e.target.result, {type:'array'});
             const ws = wb.Sheets[wb.SheetNames[0]];
             const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-            let colEmail = -1;
+            let colEmail = -1, colNombre = -1, colApellido = -1;
             for(let r=0; r<Math.min(5,rows.length); r++){
               const row = (rows[r]||[]).map(c=>String(c||'').toLowerCase());
               const ci = row.findIndex(h=>h.includes('correo')||h.includes('email'));
-              if(ci>=0){ colEmail=ci; rows.splice(0,r+1); break; }
+              const ni = row.findIndex(h=>h.includes('nombre') && !h.includes('apellido'));
+              const ai = row.findIndex(h=>h.includes('apellido'));
+              if(ci>=0 || ni>=0){
+                colEmail=ci; colNombre=ni; colApellido=ai;
+                rows.splice(0,r+1); break;
+              }
             }
-            if(colEmail>=0){
-              rows.forEach(row=>{
+            rows.forEach(row=>{
+              if(colEmail>=0){
                 const email = String(row[colEmail]||'').toLowerCase().trim();
                 const nie = email.split('@')[0].replace(/[.\-\s]/g,'');
                 if(nie) niesList.push(nie);
-              });
-            }
+              }
+              // También extraer nombres para matching
+              let fullName = '';
+              if(colNombre>=0) fullName += String(row[colNombre]||'').trim();
+              if(colApellido>=0) fullName += ' '+String(row[colApellido]||'').trim();
+              fullName = fullName.trim().toUpperCase();
+              if(fullName.length > 3) namesList.push(fullName);
+            });
           } else {
-            // PDF: usar pdf.js para extraer texto y encontrar emails
+            // PDF: usar pdf.js para extraer texto y encontrar emails y nombres
             try{
               const pdfDoc = await pdfjsLib.getDocument({data: e.target.result}).promise;
               let pdfText = '';
@@ -2876,66 +2888,98 @@ function importarMeet(input){
                 const tc = await page.getTextContent();
                 pdfText += tc.items.map(it=>it.str).join(' ') + ' ';
               }
+              // Extraer NIEs de emails
               const emailMatches = [...pdfText.matchAll(_emailRe)];
               emailMatches.forEach(m=>{
                 const nie = m[0].split('@')[0].replace(/[.\-\s]/g,'').toLowerCase();
                 if(nie && nie.length>3) niesList.push(nie);
               });
-              // Extraer nombres en MAYUSCULAS para fallback por nombre
-              const capsRe = /([A-Z������]{2,}(?:\s+[A-Z������]{2,})+)/g;
-              pdfNamesForDetect = [...pdfText.matchAll(capsRe)].map(m=>m[1]).filter(n=>n.length>5);
+              // Extraer nombres en MAYÚSCULAS (mínimo 2 palabras, 5+ caracteres)
+              const capsRe = /([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,}){1,5})/g;
+              const capsMatches = [...pdfText.matchAll(capsRe)];
+              capsMatches.forEach(m=>{
+                const name = m[1].trim();
+                if(name.length > 5 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO)/i.test(name)){
+                  namesList.push(name);
+                }
+              });
             } catch(pdfErr){ console.warn('PDF detection error:', pdfErr); }
           }
-          // Contar votos por sección: NIE primero, luego nombre como fallback
+
+          // ══════════════════════════════════════════════════════════════════
+          // SISTEMA DE VOTACIÓN MEJORADO PARA DETECCIÓN DE SECCIÓN
+          // ══════════════════════════════════════════════════════════════════
           const votes = {};
-          // Votos por NIE
+          const matchedStudents = new Set(); // Evitar contar el mismo estudiante 2 veces
+
+          // PASO 1: Votos por NIE (alta confianza - peso 2)
           niesList.forEach(nie=>{
             const norm = nie.replace(/[.\-\s]/g,'').toLowerCase();
             const match = allStudents.find(s=>{
-              if(!s.nie) return false;
+              if(!s.nie || matchedStudents.has(s.id)) return false;
               const snie = s.nie.replace(/[.\-\s]/g,'').toLowerCase();
-              return snie===norm || snie.startsWith(norm) || norm.startsWith(snie);
+              // Match exacto o parcial
+              return snie===norm || snie.startsWith(norm) || norm.startsWith(snie) ||
+                     (norm.length >= 6 && snie.includes(norm)) ||
+                     (snie.length >= 6 && norm.includes(snie));
             });
             if(match){
+              matchedStudents.add(match.id);
               const k = normGS(match.grado)+'|||'+normGS(match.seccion);
-              votes[k] = (votes[k]||0)+1;
+              votes[k] = (votes[k]||0) + 2; // Peso 2 para NIE
             }
           });
-          // Si no hubo votos por NIE, votar por nombre (normalizado)
-          if(Object.keys(votes).length === 0 && pdfNamesForDetect && pdfNamesForDetect.length){
-            pdfNamesForDetect.forEach(pname=>{
-              const pn = pname.toLowerCase().replace(/[^a-záéíóúña-z]/g,' ').replace(/\s+/g,' ').trim();
-              const pwords = pn.split(' ').filter(w=>w.length>2);
-              allStudents.forEach(s=>{
-                const sn = s.nombre.toLowerCase().replace(/[^a-záéíóúña-z]/g,' ').replace(/\s+/g,' ').trim();
-                const swords = sn.split(' ').filter(w=>w.length>2);
-                const shared = pwords.filter(w=>swords.includes(w)).length;
-                if(shared >= 2){
-                  const k = normGS(s.grado)+'|||'+normGS(s.seccion);
-                  votes[k] = (votes[k]||0)+1;
-                }
-              });
+
+          // PASO 2: Votos por nombre (peso 1, usando meetNombreScore si existe)
+          const scoreThreshold = 0.55;
+          namesList.forEach(pname=>{
+            let bestMatch = null, bestScore = 0;
+            allStudents.forEach(s=>{
+              if(matchedStudents.has(s.id)) return;
+              // Usar meetNombreScore si está disponible
+              let score = 0;
+              if(typeof meetNombreScore === 'function'){
+                score = meetNombreScore(s.nombre, pname);
+              } else {
+                // Fallback: contar palabras compartidas
+                const pn = normalizeStr(pname).split(' ').filter(w=>w.length>2);
+                const sn = normalizeStr(s.nombre).split(' ').filter(w=>w.length>2);
+                const shared = pn.filter(w=>sn.includes(w)).length;
+                score = shared / Math.max(pn.length, sn.length, 1);
+              }
+              if(score > bestScore){ bestScore = score; bestMatch = s; }
             });
-          }
-          const totalVotos = niesList.length || (pdfNamesForDetect||[]).length;
-          if(Object.keys(votes).length > 0){
-            // Sección con más matches
+            if(bestMatch && bestScore >= scoreThreshold){
+              matchedStudents.add(bestMatch.id);
+              const k = normGS(bestMatch.grado)+'|||'+normGS(bestMatch.seccion);
+              votes[k] = (votes[k]||0) + 1; // Peso 1 para nombre
+            }
+          });
+
+          const totalVotos = matchedStudents.size;
+          if(Object.keys(votes).length > 0 && totalVotos >= 2){
+            // Sección con más votos ponderados
             const bestKey = Object.keys(votes).sort((a,b)=>votes[b]-votes[a])[0];
             const bestVotes = votes[bestKey];
-            const confianza = Math.round(bestVotes/Math.max(totalVotos,1)*100);
-              const [g,s] = bestKey.split('|||');
-              const canon = secciones.find(sec=>sec.key===bestKey);
+            // Confianza basada en cuántos estudiantes de esa sección fueron detectados
+            const [g,s] = bestKey.split('|||');
+            const studentsInSection = allStudents.filter(st=>
+              normGS(st.grado)===g && normGS(st.seccion)===s
+            ).length;
+            const confianza = Math.round(Math.min(bestVotes / Math.max(studentsInSection * 0.3, 1), 1) * 100);
+            const canon = secciones.find(sec=>sec.key===bestKey);
 
-              // Actualizar el select del modal si sigue abierto
-              const container = document.getElementById('meet-seccion-container');
-              if(container){
-                container.innerHTML = _buildMeetSeccionField(
-                  secciones, bestKey,
-                  {grado: canon?canon.grado:g, seccion: canon?canon.seccion:s, votes:bestVotes, total:niesList.length, confianza}
-                );
-                _meetSyncSel();
-              }
+            // Actualizar el select del modal si sigue abierto
+            const container = document.getElementById('meet-seccion-container');
+            if(container){
+              container.innerHTML = _buildMeetSeccionField(
+                secciones, bestKey,
+                {grado: canon?canon.grado:g, seccion: canon?canon.seccion:s, votes:totalVotos, total:niesList.length+namesList.length, confianza}
+              );
+              _meetSyncSel();
             }
+            console.log('[SECCIÓN DETECTADA]', canon?canon.grado+' '+canon.seccion:'?', '| Votos:', votes, '| Confianza:', confianza+'%');
+          }
         } catch(err){ console.warn('Detección de sección falló:', err); }
       };
       reader.readAsArrayBuffer(file);
@@ -3098,100 +3142,313 @@ function parseMeetPDFText(text, fecha, materia, grado, seccion, minMin){
   const students = getStudents().filter(s=>normGS(s.grado)===normGS(grado)&&normGS(s.seccion)===normGS(seccion));
   if(!students.length){ toast('⚠️ No hay estudiantes en '+grado+' "'+seccion+'"'); return; }
 
-  // pdf.js en modo fake-worker entrega todo como 1 linea - dividimos por email
-  const rawLines = text.split(/\n/).map(l=>l.trim()).filter(Boolean);
+  // ══════════════════════════════════════════════════════════════════════════
+  // PARSER ROBUSTO PARA PDFs DE GOOGLE MEET (incluyendo exportaciones móviles)
+  // Soporta: tablas de Sheets exportadas a PDF, texto continuo, formatos variados
+  // ══════════════════════════════════════════════════════════════════════════
+
   const emailReG = /[\w.\-+]+@[\w.\-]+\.\w{2,}/gi;
-  let lines = rawLines;
-  if(rawLines.length <= 3 && rawLines.join(' ').match(emailReG)){
-    const bigText = rawLines.join(' ');
-    const emails  = [...bigText.matchAll(emailReG)];
-    // Extrae la ultima secuencia de palabras en MAYUSCULAS antes del email = nombre real
-    const capsNameRe = /([A-Z\xc1\xc9\xcd\xd3\xda\xd1\xc0-\xd6\xd8-\xde]{2,}(?:\s+[A-Z\xc1\xc9\xcd\xd3\xda\xd1\xc0-\xd6\xd8-\xde]{2,})+)\s*$/;
-    lines = [];
-    emails.forEach((em,i)=>{
-      const start   = i===0 ? 0 : emails[i-1].index + emails[i-1][0].length;
-      const rawChunk = bigText.slice(start, em.index);
-      const capsM   = rawChunk.match(capsNameRe);
-      const namePart = capsM ? capsM[1].trim() : '';
-      const restEnd = i<emails.length-1 ? emails[i+1].index : bigText.length;
-      const rest    = bigText.slice(em.index + em[0].length, restEnd).trim();
-      if(namePart) lines.push(namePart);
-      lines.push(em[0] + ' ' + rest);
+  const emailRe = /[\w.\-+]+@[\w.\-]+\.\w{2,}/i;
+  // Regex de duración extendido: "1 h 6 min", "52 min", "1h", "45min", "17 s", "1:06:30", "01:15:00"
+  const durRe = /(\d+)\s*[h:]\s*(\d+)\s*(?:min|m|:)?(?:\s*(\d+)\s*(?:s|seg)?)?|(\d+)\s*h(?:oras?)?\b|(\d+)\s*min(?:utos?)?\b|(\d+)\s*m\b|(\d+)\s*s(?:eg(?:undos?)?)?\b/i;
+  const timeRe = /\d{1,2}:\d{2}\s*(a\.?m\.?|p\.?m\.?)/i;
+  const tableHdrRe = /(nombre|apellido|correo electr|duraci|\bhora\b|abandon|se uni|reuni|participante|email|tiempo|asistencia)/i;
+
+  // Parser de duración mejorado
+  function parseDur(str){
+    if(!str) return 0;
+    const s = String(str).trim();
+    // Formato HH:MM:SS o H:MM:SS o MM:SS
+    const hhmmss = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+    if(hhmmss){
+      const h = parseInt(hhmmss[1])||0;
+      const m = parseInt(hhmmss[2])||0;
+      const sec = parseInt(hhmmss[3])||0;
+      // Si no hay tercer grupo y el primer número es pequeño, asumir H:MM
+      if(!hhmmss[3] && h < 10) return h*60 + m;
+      return h*60 + m + (sec>=30?1:0);
+    }
+    // Formato con texto: "1 h 6 min", "52 min", "2 horas 15 minutos", etc
+    const m = s.match(durRe);
+    if(!m) return 0;
+    if(m[1]!==undefined && m[2]!==undefined){
+      return parseInt(m[1])*60 + parseInt(m[2]) + (m[3] && parseInt(m[3])>=30?1:0);
+    }
+    if(m[4]) return parseInt(m[4])*60;
+    if(m[5]) return parseInt(m[5]);
+    if(m[6]) return parseInt(m[6]);
+    if(m[7]) return Math.ceil(parseInt(m[7])/60)||1;
+    return 0;
+  }
+
+  // Preprocesar texto: normalizar saltos de línea
+  let cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const rawLines = cleanText.split(/\n/).map(l=>l.trim()).filter(Boolean);
+  const participants = [];
+  let parseMethod = 'unknown';
+
+  // Encontrar todos los emails en el texto
+  const allEmails = [...cleanText.matchAll(emailReG)].map(m=>({email:m[0].toLowerCase(), idx:m.index}));
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MÉTODO 1: Detección de formato tabular (PDF de Google Sheets desde teléfono)
+  // ══════════════════════════════════════════════════════════════════════════
+  if(allEmails.length >= 2){
+    parseMethod = 'tabular';
+    allEmails.forEach((em, i) => {
+      const startIdx = i===0 ? 0 : allEmails[i-1].idx + allEmails[i-1].email.length;
+      const chunk = cleanText.slice(startIdx, em.idx);
+      const afterEmail = cleanText.slice(em.idx + em.email.length,
+        i < allEmails.length-1 ? allEmails[i+1].idx : Math.min(em.idx + em.email.length + 150, cleanText.length));
+
+      // Extraer nombre: texto antes del email, limpiando basura
+      let namePart = chunk
+        .replace(/\n/g, ' ')
+        .replace(tableHdrRe, '')
+        .replace(/\d{1,2}:\d{2}\s*(a\.?m\.?|p\.?m\.?)/gi, '')
+        .replace(/^\s*\d+[\.\)\-]?\s*/, '')
+        .trim();
+
+      // Buscar nombre en MAYÚSCULAS (formato común de Meet)
+      const capsMatch = namePart.match(/([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{4,})/);
+      if(capsMatch && capsMatch[1].trim().length > 4){
+        namePart = capsMatch[1].trim();
+      } else {
+        // Tomar palabras que parezcan nombre (últimas 2-4 palabras con letras)
+        const words = namePart.split(/\s+/).filter(w=>w.length>1 && /^[a-záéíóúñA-ZÁÉÍÓÚÑ]+$/i.test(w));
+        namePart = words.slice(-4).join(' ');
+      }
+
+      // Extraer duración: buscar después del email primero
+      let dur = 0;
+      const durPatterns = [
+        /(\d+)\s*h(?:oras?)?\s*(\d+)?\s*m?i?n?/i,
+        /(\d+)\s*min(?:utos?)?/i,
+        /(\d{1,2}):(\d{2})(?::(\d{2}))?/,
+        durRe
+      ];
+      for(const pat of durPatterns){
+        const match = afterEmail.match(pat);
+        if(match){
+          dur = parseDur(match[0]);
+          if(dur > 0) break;
+        }
+      }
+      // Si no encontró, buscar en el chunk antes del email
+      if(!dur){
+        for(const pat of durPatterns){
+          const match = chunk.match(pat);
+          if(match && !timeRe.test(match[0])){
+            dur = parseDur(match[0]);
+            if(dur > 0) break;
+          }
+        }
+      }
+
+      const name = namePart.replace(/\s+/g, ' ').trim().toUpperCase();
+      if(name.length > 1 || em.email){
+        participants.push({name: name||'', email: em.email, durationMin: dur||1});
+      }
     });
   }
-  // durRe incluye segundos (17 s)
-  const durRe  = /(\d+)\s*h\s*(\d+)\s*min|(\d+)\s*h\b|(\d+)\s*min\b|(\d+)\s*s(?:eg)?\b/i;
-  const emailRe = /[\w.\-+]+@[\w.\-]+\.\w{2,}/i;
-  const timeRe  = /\d{1,2}:\d{2}\s*(a\.?m\.?|p\.?m\.?)/i;
-  const tableHdrRe = /(nombre|apellido|correo electr|duraci|\bhora\b|abandon|se uni|reuni)/i;
 
-  function parseDur(m){ if(!m) return 0; if(m[1]) return parseInt(m[1])*60+parseInt(m[2]||0); if(m[3]) return parseInt(m[3])*60; if(m[4]) return parseInt(m[4]); return Math.ceil(parseInt(m[5])/60)||1; }
+  // ══════════════════════════════════════════════════════════════════════════
+  // MÉTODO 2: Líneas con emails (formato clásico)
+  // ══════════════════════════════════════════════════════════════════════════
+  if(!participants.length && rawLines.length > 3){
+    parseMethod = 'lines';
+    let lines = rawLines;
 
-  // ── PASS 1: email como ancla ──
-  const participants = [];
-  const emailLines = [];
-  lines.forEach((l,i)=>{ if(emailRe.test(l)) emailLines.push(i); });
-
-  emailLines.forEach((eIdx,ei)=>{
-    const lineWithEmail = lines[eIdx];
-    const email = lineWithEmail.match(emailRe)[0].toLowerCase();
-    // Duracion en la misma linea (Drive PDF) o en lineas siguientes (clasico)
-    let durationMin=0;
-    const dmSame = lineWithEmail.match(durRe);
-    if(dmSame) durationMin=parseDur(dmSame);
-    if(!durationMin){ for(let f=eIdx+1;f<Math.min(eIdx+5,lines.length);f++){ const dm=lines[f].match(durRe); if(dm){durationMin=parseDur(dm);break;} } }
-    // Nombre: lineas previas en orden + texto antes del email
-    const nameParts=[];
-    const prevEIdx = ei>0 ? emailLines[ei-1] : -1;
-    for(let b=Math.max(prevEIdx+1,eIdx-4);b<eIdx;b++){
-      const l=lines[b];
-      if(emailRe.test(l)||tableHdrRe.test(l)||timeRe.test(l)||durRe.test(l)) continue;
-      if(l.length>1&&/[a-zA-ZáéíóúÁÉÍÓÚñÑ]/.test(l)) nameParts.push(l);
+    // Si hay pocas líneas pero muchos emails, expandir
+    if(rawLines.length <= 5 && allEmails.length > rawLines.length){
+      const bigText = rawLines.join(' ');
+      const capsNameRe = /([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,})+)\s*$/;
+      lines = [];
+      allEmails.forEach((em,i)=>{
+        const start = i===0 ? 0 : allEmails[i-1].idx + allEmails[i-1].email.length;
+        const rawChunk = bigText.slice(start, em.idx);
+        const capsM = rawChunk.match(capsNameRe);
+        const namePart = capsM ? capsM[1].trim() : '';
+        const restEnd = i<allEmails.length-1 ? allEmails[i+1].idx : bigText.length;
+        const rest = bigText.slice(em.idx + em.email.length, restEnd).trim();
+        if(namePart) lines.push(namePart);
+        lines.push(em.email + ' ' + rest);
+      });
     }
-    const beforeEmail=lineWithEmail.slice(0,lineWithEmail.indexOf(email)).trim();
-    if(beforeEmail.length>1&&!timeRe.test(beforeEmail)&&!durRe.test(beforeEmail)&&!tableHdrRe.test(beforeEmail)) nameParts.push(beforeEmail);
-    const name=nameParts.join(' ').replace(/\s+/g,' ').trim().toUpperCase();
-    console.log('[PDF DEBUG] p:', email, 'dur:', durationMin, 'name:', name);
-    if(name.length>1) participants.push({name, email, durationMin:durationMin||1});
+
+    const emailLines = [];
+    lines.forEach((l,i)=>{ if(emailRe.test(l)) emailLines.push(i); });
+
+    emailLines.forEach((eIdx,ei)=>{
+      const lineWithEmail = lines[eIdx];
+      const emailMatch = lineWithEmail.match(emailRe);
+      if(!emailMatch) return;
+      const email = emailMatch[0].toLowerCase();
+
+      let durationMin = 0;
+      const dmSame = lineWithEmail.match(durRe);
+      if(dmSame) durationMin = parseDur(dmSame[0]);
+      if(!durationMin){
+        for(let f=eIdx+1; f<Math.min(eIdx+5, lines.length); f++){
+          const dm = lines[f].match(durRe);
+          if(dm){ durationMin = parseDur(dm[0]); break; }
+          const hms = lines[f].match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+          if(hms && !timeRe.test(lines[f])){ durationMin = parseDur(hms[0]); break; }
+        }
+      }
+
+      const nameParts = [];
+      const prevEIdx = ei > 0 ? emailLines[ei-1] : -1;
+      for(let b = Math.max(prevEIdx+1, eIdx-4); b < eIdx; b++){
+        const l = lines[b];
+        if(emailRe.test(l) || tableHdrRe.test(l) || timeRe.test(l) || durRe.test(l)) continue;
+        if(l.length > 1 && /[a-zA-ZáéíóúÁÉÍÓÚñÑ]/.test(l)) nameParts.push(l);
+      }
+      const beforeEmail = lineWithEmail.slice(0, lineWithEmail.indexOf(email)).trim();
+      if(beforeEmail.length > 1 && !timeRe.test(beforeEmail) && !durRe.test(beforeEmail) && !tableHdrRe.test(beforeEmail)){
+        nameParts.push(beforeEmail);
+      }
+
+      const name = nameParts.join(' ').replace(/\s+/g, ' ').trim().toUpperCase();
+      if(name.length > 1) participants.push({name, email, durationMin: durationMin||1});
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MÉTODO 3: Fallback por duración
+  // ══════════════════════════════════════════════════════════════════════════
+  if(!participants.length){
+    parseMethod = 'duration-fallback';
+    rawLines.forEach((line, idx) => {
+      const dm = line.match(durRe);
+      if(!dm) return;
+      const durationMin = parseDur(dm[0]);
+      let email = '';
+      const nameParts = [];
+      for(let b = Math.max(0, idx-6); b <= idx; b++){
+        const em = rawLines[b].match(emailRe);
+        if(em) email = em[0].toLowerCase();
+        const l = rawLines[b];
+        if(!emailRe.test(l) && !durRe.test(l) && !timeRe.test(l) && !tableHdrRe.test(l) && l.length > 1 && /[a-zA-ZáéíóúÁÉÍÓÚñÑ]/.test(l)){
+          nameParts.push(l);
+        }
+      }
+      const name = nameParts.join(' ').replace(/\s+/g, ' ').trim().toUpperCase();
+      if(email || name) participants.push({name, email, durationMin: durationMin||1});
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // MÉTODO 4: Último recurso - nombres en MAYÚSCULAS con match a estudiantes
+  // ══════════════════════════════════════════════════════════════════════════
+  if(!participants.length){
+    parseMethod = 'uppercase-names';
+    const capsRe = /([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,}){1,5})/g;
+    const capsMatches = [...cleanText.matchAll(capsRe)];
+    const seenNames = new Set();
+
+    capsMatches.forEach(m => {
+      const name = m[1].trim();
+      const nameNorm = normalizeStr(name);
+      if(seenNames.has(nameNorm) || name.length < 5 || tableHdrRe.test(name)) return;
+
+      const matchStudent = students.find(s => meetNombreScore(s.nombre, name) >= 0.5);
+      if(matchStudent){
+        seenNames.add(nameNorm);
+        const nameIdx = m.index;
+        const context = cleanText.slice(nameIdx, nameIdx + 100);
+        const durM = context.match(durRe);
+        const dur = durM ? parseDur(durM[0]) : 1;
+        const emailCtx = cleanText.slice(Math.max(0, nameIdx-50), nameIdx + 150);
+        const emailM = emailCtx.match(emailRe);
+        participants.push({name, email: emailM ? emailM[0].toLowerCase() : '', durationMin: dur});
+      }
+    });
+  }
+
+  console.log('[PDF PARSER] Método:', parseMethod, '| Participantes:', participants.length);
+  participants.forEach((p,i) => console.log('[PDF DEBUG]', i+1, p.name, '|', p.email, '|', p.durationMin+'min'));
+
+  if(!participants.length){
+    toast('❌ No se pudo leer el PDF. Verificá que sea texto seleccionable o probá exportando como Excel.');
+    return;
+  }
+
+  // Deduplicar participantes por email o nombre
+  const seen = new Set();
+  const uniqueParticipants = participants.filter(p => {
+    const key = p.email || normalizeStr(p.name);
+    if(seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
 
-  // ── PASS 2: fallback por duracion ──
-  if(!participants.length){
-    lines.forEach((line,idx)=>{
-      const dm=line.match(durRe); if(!dm) return;
-      const durationMin=parseDur(dm);
-      let email=''; const nameParts=[];
-      for(let b=Math.max(0,idx-6);b<=idx;b++){
-        const em=lines[b].match(emailRe); if(em) email=em[0].toLowerCase();
-        const l=lines[b];
-        if(!emailRe.test(l)&&!durRe.test(l)&&!timeRe.test(l)&&!tableHdrRe.test(l)&&l.length>1&&/[a-zA-ZáéíóúÁÉÍÓÚñÑ]/.test(l)) nameParts.push(l);
-      }
-      const name=nameParts.join(' ').replace(/\s+/g,' ').trim().toUpperCase();
-      if(email||name) participants.push({name,email,durationMin:durationMin||1});
-    });
-  }
-
-  if(!participants.length){ toast('❌ No se pudo leer el PDF. Verificá que sea texto seleccionable.'); return; }
-  parseMeetParticipants(participants, fecha, materia, grado, seccion, minMin);
+  parseMeetParticipants(uniqueParticipants, fecha, materia, grado, seccion, minMin);
 }
 
 // ── Utilidad: score de similitud entre nombre del sistema y nombre del Meet ──
-// Retorna 0..1. Tolera: orden invertido (apellido/nombre vs nombre/apellido),
-// tildes, ñ, mayúsculas/minúsculas, espacios extras, iniciales.
+// ══════════════════════════════════════════════════════════════════════════════
+// SCORING DE SIMILITUD MEJORADO PARA MATCHING DE NOMBRES
+// Retorna 0..1. Tolera: orden invertido, tildes, errores tipográficos, iniciales
+// ══════════════════════════════════════════════════════════════════════════════
 function meetNombreScore(nombreSistema, nombreMeet){
   const sN = normalizeStr(nombreSistema).replace(/[,\.]/g,' ').replace(/\s+/g,' ').trim();
   const pN = normalizeStr(nombreMeet).replace(/[,\.]/g,' ').replace(/\s+/g,' ').trim();
   if(!sN || !pN) return 0;
   if(sN === pN) return 1.0;
+
   // Palabras significativas (>2 chars) de cada lado
-  const sW = new Set(sN.split(' ').filter(w=>w.length>2));
-  const pW = new Set(pN.split(' ').filter(w=>w.length>2));
-  if(!sW.size || !pW.size) return 0;
-  // Intersección de palabras únicas
-  let shared = 0;
-  sW.forEach(w=>{ if(pW.has(w)) shared++; });
-  // Score = compartidas / máximo posible
-  return shared / Math.max(sW.size, pW.size);
+  const sWords = sN.split(' ').filter(w=>w.length>2);
+  const pWords = pN.split(' ').filter(w=>w.length>2);
+  if(!sWords.length || !pWords.length) return 0;
+
+  // Función de similitud entre dos palabras (tolerante a errores)
+  function wordSimilarity(a, b){
+    if(a === b) return 1.0;
+    if(a.length < 2 || b.length < 2) return 0;
+    // Una es prefijo de la otra (ej: "JOSE" vs "JOSEFINA")
+    if(a.startsWith(b) || b.startsWith(a)) return 0.85;
+    // Similitud por caracteres comunes (tipo Dice coefficient)
+    const setA = new Set(a.split(''));
+    const setB = new Set(b.split(''));
+    let common = 0;
+    setA.forEach(c => { if(setB.has(c)) common++; });
+    const dice = (2 * common) / (setA.size + setB.size);
+    // Penalizar si las longitudes son muy diferentes
+    const lenRatio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
+    return dice * lenRatio * 0.7;
+  }
+
+  // Calcular matches entre palabras (cada palabra del sistema busca su mejor match en Meet)
+  let totalScore = 0;
+  let matchedPWords = new Set();
+
+  sWords.forEach(sw => {
+    let bestScore = 0, bestIdx = -1;
+    pWords.forEach((pw, idx) => {
+      if(matchedPWords.has(idx)) return;
+      const sim = wordSimilarity(sw, pw);
+      if(sim > bestScore){ bestScore = sim; bestIdx = idx; }
+    });
+    if(bestScore >= 0.6 && bestIdx >= 0){
+      matchedPWords.add(bestIdx);
+      totalScore += bestScore;
+    }
+  });
+
+  // Score final: promedio de matches encontrados vs palabras esperadas
+  const expectedMatches = Math.min(sWords.length, pWords.length);
+  const baseScore = totalScore / expectedMatches;
+
+  // Bonus si el orden es igual (primer nombre igual = probable mismo estudiante)
+  let orderBonus = 0;
+  if(sWords[0] === pWords[0]) orderBonus = 0.1;
+  else if(sWords[0] === pWords[pWords.length-1] || sWords[sWords.length-1] === pWords[0]) orderBonus = 0.05;
+
+  // Penalización si hay muchas palabras extra en uno de los lados
+  const extraWordsPenalty = Math.abs(sWords.length - pWords.length) * 0.05;
+
+  return Math.min(1.0, Math.max(0, baseScore + orderBonus - extraWordsPenalty));
 }
 
 // ── Shared: match participants list to students and create session ──
@@ -3270,7 +3527,7 @@ function resolverMeet_nueva(){
 
 function parseMeetParticipants(participants, fecha, materia, grado, seccion, minMin, existingSessionId=null){
   const DOMAIN_INST = 'clases.edu.sv';
-  const NAME_SCORE_THRESHOLD = 0.6; // >=60% palabras coinciden -> match
+  const NAME_SCORE_THRESHOLD = 0.55; // Threshold reducido porque meetNombreScore mejorado es más preciso
 
   // ── Participants con correo no institucional (para panel de verificación) ──
   const nonInstitutional = participants.filter(p=>p.email && !p.email.endsWith('@'+DOMAIN_INST));
@@ -3305,46 +3562,81 @@ function parseMeetParticipants(participants, fecha, materia, grado, seccion, min
   let presentes=0, tardes=0, ausentes=0;
   const matchDetails = [];
 
+  // Set para evitar que un participante sea asignado a múltiples estudiantes
+  const usedParticipants = new Set();
+
   students.forEach(s=>{
     const nieClean = (s.nie||'').replace(/[.\-\s]/g,'').toLowerCase();
     let found = null, matchType = null, matchScore = 0;
 
-    // ── Paso 1: NIE exacto en parte local del correo ──
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 1: NIE exacto en parte local del correo (máxima confianza)
     // Ej: "6867888@clases.edu.sv" → local="6867888", nie="6867888" → match
-    // También soporta nie con puntos: "6.867.888" → limpio "6867888"
-    if(nieClean){
+    // ══════════════════════════════════════════════════════════════════════════
+    if(nieClean && !found){
       found = participants.find(p=>{
+        if(usedParticipants.has(p)) return false;
         const local = (p.email||'').split('@')[0].replace(/[.\-\s]/g,'').toLowerCase();
         return local && local === nieClean;
       });
       if(found){ matchType='NIE'; matchScore=1.0; }
     }
 
-    // ── Paso 2: NIE contenido en correo no numérico ──
-    // Ej: correo "francisco.monzon.contreras@..." y nie "francisco.monzon.contreras"
-    if(!found && nieClean && nieClean.length>4){
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 2: NIE contenido en correo (alta confianza)
+    // Ej: correo "nie6867888@gmail.com" y nie "6867888"
+    // ══════════════════════════════════════════════════════════════════════════
+    if(!found && nieClean && nieClean.length>=5){
       found = participants.find(p=>{
+        if(usedParticipants.has(p)) return false;
         const local = (p.email||'').split('@')[0].replace(/[.\-\s]/g,'').toLowerCase();
-        return local && (local.includes(nieClean)||nieClean.includes(local));
+        return local && (local.includes(nieClean) || nieClean.includes(local));
       });
-      if(found){ matchType='NIE-parcial'; matchScore=0.9; }
+      if(found){ matchType='NIE-parcial'; matchScore=0.95; }
     }
 
-    // ── Paso 3: scoring por nombre (tolerante a orden, tildes, iniciales) ──
-    // El Meet exporta "Nombre Apellido"; el sistema puede tener "Apellido Nombre"
-    // Se prueban ambas variantes y se elige el mejor score.
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 3: NIE numérico en el nombre del participante
+    // Para cuando el alumno pone su NIE en el nombre de Meet
+    // Ej: nombre Meet "6867888 JUAN PEREZ" y nie "6867888"
+    // ══════════════════════════════════════════════════════════════════════════
+    if(!found && nieClean && /^\d{5,}$/.test(nieClean)){
+      found = participants.find(p=>{
+        if(usedParticipants.has(p)) return false;
+        const nameClean = (p.name||'').replace(/[.\-\s]/g,'').toLowerCase();
+        return nameClean.includes(nieClean);
+      });
+      if(found){ matchType='NIE-en-nombre'; matchScore=0.92; }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASO 4: Scoring por nombre (tolerante a orden, tildes, errores)
+    // Prueba múltiples variantes del nombre para encontrar el mejor match
+    // ══════════════════════════════════════════════════════════════════════════
     if(!found){
       let bestScore = 0, bestP = null;
       participants.forEach(p=>{
+        if(usedParticipants.has(p)) return;
         if(!p.name) return;
+
         // Variante 1: nombre tal como viene del Meet
         const sc1 = meetNombreScore(s.nombre, p.name);
-        // Variante 2: nombre invertido (por si en el sistema está en otro orden)
+
+        // Variante 2: nombre invertido (mitad)
         const parts = (p.name||'').trim().split(/\s+/);
         const mitad = Math.ceil(parts.length/2);
         const invertido = parts.slice(mitad).join(' ')+' '+parts.slice(0,mitad).join(' ');
         const sc2 = meetNombreScore(s.nombre, invertido);
-        const sc = Math.max(sc1, sc2);
+
+        // Variante 3: solo primeras 2 palabras (para nombres muy largos)
+        const corto = parts.slice(0,2).join(' ');
+        const sc3 = parts.length > 2 ? meetNombreScore(s.nombre, corto) * 0.9 : 0;
+
+        // Variante 4: últimas 2 palabras (apellidos)
+        const apellidos = parts.slice(-2).join(' ');
+        const sc4 = parts.length > 2 ? meetNombreScore(s.nombre, apellidos) * 0.85 : 0;
+
+        const sc = Math.max(sc1, sc2, sc3, sc4);
         if(sc > bestScore){ bestScore=sc; bestP=p; }
       });
       if(bestScore >= NAME_SCORE_THRESHOLD){
@@ -3353,12 +3645,15 @@ function parseMeetParticipants(participants, fecha, materia, grado, seccion, min
     }
 
     if(found){
+      usedParticipants.add(found);
       const status = found.durationMin >= minMin ? 1 : 3;
       attDB[id][s.id] = status;
       if(status===1) presentes++; else tardes++;
       matchDetails.push({student:s, participant:found, matchType, matchScore});
+      console.log('[MATCH]', s.nombre, '←', found.name||found.email, '|', matchType, Math.round(matchScore*100)+'%');
     } else {
       attDB[id][s.id] = 0; ausentes++;
+      console.log('[NO MATCH]', s.nombre);
     }
   });
 
