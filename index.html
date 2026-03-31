@@ -2881,6 +2881,7 @@ function importarMeet(input){
           } else {
             // PDF: usar pdf.js para extraer texto y encontrar emails y nombres
             try{
+              console.log('[DETECT] Iniciando extracción de PDF...');
               const pdfDoc = await pdfjsLib.getDocument({data: e.target.result}).promise;
               let pdfText = '';
               for(let pi=1; pi<=pdfDoc.numPages; pi++){
@@ -2888,60 +2889,83 @@ function importarMeet(input){
                 const tc = await page.getTextContent();
                 pdfText += tc.items.map(it=>it.str).join(' ') + ' ';
               }
+              console.log('[DETECT] Texto PDF extraído, longitud:', pdfText.length);
+
               // Extraer NIEs de emails
               const emailMatches = [...pdfText.matchAll(_emailRe)];
               emailMatches.forEach(m=>{
                 const nie = m[0].split('@')[0].replace(/[.\-\s]/g,'').toLowerCase();
                 if(nie && nie.length>3) niesList.push(nie);
               });
-              // Extraer nombres en MAYÚSCULAS (mínimo 2 palabras, 5+ caracteres)
-              const capsRe = /([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,}){1,5})/g;
-              const capsMatches = [...pdfText.matchAll(capsRe)];
+              console.log('[DETECT] Emails encontrados:', niesList.length, niesList.slice(0,3));
+
+              // Extraer nombres - múltiples estrategias
+              // Estrategia 1: Nombres en MAYÚSCULAS (formato común de Meet)
+              const capsRe = /([A-ZÁÉÍÓÚÑÜ]{2,}(?:\s+[A-ZÁÉÍÓÚÑÜ]{2,}){1,5})/g;
+              let capsMatches = [...pdfText.matchAll(capsRe)];
               capsMatches.forEach(m=>{
                 const name = m[1].trim();
-                if(name.length > 5 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO)/i.test(name)){
+                if(name.length > 4 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO|ASISTENCIA|PARTICIPANTE)/i.test(name)){
                   namesList.push(name);
                 }
               });
-            } catch(pdfErr){ console.warn('PDF detection error:', pdfErr); }
+
+              // Estrategia 2: Nombres en formato Title Case (Primera Mayúscula)
+              const titleRe = /([A-ZÁÉÍÓÚÑÜ][a-záéíóúñü]+(?:\s+[A-ZÁÉÍÓÚÑÜ][a-záéíóúñü]+){1,4})/g;
+              let titleMatches = [...pdfText.matchAll(titleRe)];
+              titleMatches.forEach(m=>{
+                const name = m[1].trim().toUpperCase();
+                if(name.length > 4 && !namesList.includes(name) &&
+                   !/^(Nombre|Apellido|Correo|Email|Duraci|Hora|Tiempo)/i.test(m[1])){
+                  namesList.push(name);
+                }
+              });
+
+              console.log('[DETECT] Nombres encontrados:', namesList.length, namesList.slice(0,5));
+            } catch(pdfErr){
+              console.error('[DETECT] Error PDF:', pdfErr);
+            }
           }
 
+          console.log('[DETECT] Total NIEs:', niesList.length, '| Total nombres:', namesList.length);
+          console.log('[DETECT] Estudiantes en BD:', allStudents.length);
+
           // ══════════════════════════════════════════════════════════════════
-          // SISTEMA DE VOTACIÓN MEJORADO PARA DETECCIÓN DE SECCIÓN
+          // SISTEMA DE VOTACIÓN PARA DETECCIÓN DE SECCIÓN
           // ══════════════════════════════════════════════════════════════════
           const votes = {};
-          const matchedStudents = new Set(); // Evitar contar el mismo estudiante 2 veces
+          const matchedStudents = new Set();
 
           // PASO 1: Votos por NIE (alta confianza - peso 2)
           niesList.forEach(nie=>{
             const norm = nie.replace(/[.\-\s]/g,'').toLowerCase();
-            const match = allStudents.find(s=>{
-              if(!s.nie || matchedStudents.has(s.id)) return false;
+            allStudents.forEach(s=>{
+              if(!s.nie || matchedStudents.has(s.id)) return;
               const snie = s.nie.replace(/[.\-\s]/g,'').toLowerCase();
-              // Match exacto o parcial
-              return snie===norm || snie.startsWith(norm) || norm.startsWith(snie) ||
-                     (norm.length >= 6 && snie.includes(norm)) ||
-                     (snie.length >= 6 && norm.includes(snie));
+              // Match flexible
+              const isMatch = snie===norm ||
+                     snie.startsWith(norm) || norm.startsWith(snie) ||
+                     (norm.length >= 5 && snie.includes(norm)) ||
+                     (snie.length >= 5 && norm.includes(snie));
+              if(isMatch){
+                matchedStudents.add(s.id);
+                const k = normGS(s.grado)+'|||'+normGS(s.seccion);
+                votes[k] = (votes[k]||0) + 2;
+                console.log('[DETECT] Match NIE:', nie, '→', s.nombre, s.grado, s.seccion);
+              }
             });
-            if(match){
-              matchedStudents.add(match.id);
-              const k = normGS(match.grado)+'|||'+normGS(match.seccion);
-              votes[k] = (votes[k]||0) + 2; // Peso 2 para NIE
-            }
           });
 
-          // PASO 2: Votos por nombre (peso 1, usando meetNombreScore si existe)
-          const scoreThreshold = 0.55;
+          // PASO 2: Votos por nombre (peso 1)
+          const scoreThreshold = 0.45; // Más permisivo
           namesList.forEach(pname=>{
             let bestMatch = null, bestScore = 0;
             allStudents.forEach(s=>{
               if(matchedStudents.has(s.id)) return;
-              // Usar meetNombreScore si está disponible
               let score = 0;
               if(typeof meetNombreScore === 'function'){
                 score = meetNombreScore(s.nombre, pname);
               } else {
-                // Fallback: contar palabras compartidas
                 const pn = normalizeStr(pname).split(' ').filter(w=>w.length>2);
                 const sn = normalizeStr(s.nombre).split(' ').filter(w=>w.length>2);
                 const shared = pn.filter(w=>sn.includes(w)).length;
@@ -2952,24 +2976,25 @@ function importarMeet(input){
             if(bestMatch && bestScore >= scoreThreshold){
               matchedStudents.add(bestMatch.id);
               const k = normGS(bestMatch.grado)+'|||'+normGS(bestMatch.seccion);
-              votes[k] = (votes[k]||0) + 1; // Peso 1 para nombre
+              votes[k] = (votes[k]||0) + 1;
+              console.log('[DETECT] Match nombre:', pname, '→', bestMatch.nombre, '('+Math.round(bestScore*100)+'%)');
             }
           });
 
           const totalVotos = matchedStudents.size;
-          if(Object.keys(votes).length > 0 && totalVotos >= 2){
-            // Sección con más votos ponderados
+          console.log('[DETECT] Votos totales:', totalVotos, '| Por sección:', votes);
+
+          // Solo necesita 1 match para detectar (antes era 2)
+          if(Object.keys(votes).length > 0 && totalVotos >= 1){
             const bestKey = Object.keys(votes).sort((a,b)=>votes[b]-votes[a])[0];
             const bestVotes = votes[bestKey];
-            // Confianza basada en cuántos estudiantes de esa sección fueron detectados
             const [g,s] = bestKey.split('|||');
             const studentsInSection = allStudents.filter(st=>
               normGS(st.grado)===g && normGS(st.seccion)===s
             ).length;
-            const confianza = Math.round(Math.min(bestVotes / Math.max(studentsInSection * 0.3, 1), 1) * 100);
+            const confianza = Math.round(Math.min(bestVotes / Math.max(studentsInSection * 0.2, 1), 1) * 100);
             const canon = secciones.find(sec=>sec.key===bestKey);
 
-            // Actualizar el select del modal si sigue abierto
             const container = document.getElementById('meet-seccion-container');
             if(container){
               container.innerHTML = _buildMeetSeccionField(
@@ -2977,10 +3002,12 @@ function importarMeet(input){
                 {grado: canon?canon.grado:g, seccion: canon?canon.seccion:s, votes:totalVotos, total:niesList.length+namesList.length, confianza}
               );
               _meetSyncSel();
+              console.log('[DETECT] ✓ SECCIÓN DETECTADA:', canon?canon.grado+' '+canon.seccion:'?', '| Confianza:', confianza+'%');
             }
-            console.log('[SECCIÓN DETECTADA]', canon?canon.grado+' '+canon.seccion:'?', '| Votos:', votes, '| Confianza:', confianza+'%');
+          } else {
+            console.log('[DETECT] ✗ No se pudo detectar sección automáticamente');
           }
-        } catch(err){ console.warn('Detección de sección falló:', err); }
+        } catch(err){ console.error('[DETECT] Error general:', err); }
       };
       reader.readAsArrayBuffer(file);
     }
