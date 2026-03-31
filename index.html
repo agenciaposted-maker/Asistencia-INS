@@ -2889,15 +2889,20 @@ function importarMeet(input){
                 const tc = await page.getTextContent();
                 pdfText += tc.items.map(it=>it.str).join(' ') + ' ';
               }
+              // Limpiar texto: normalizar espacios alrededor de @
+              pdfText = pdfText.replace(/\s*@\s*/g, '@').replace(/\s+/g, ' ');
               console.log('[DETECT] Texto PDF extraído, longitud:', pdfText.length);
+              console.log('[DETECT] Muestra texto:', pdfText.substring(0, 500));
 
-              // Extraer NIEs de emails
-              const emailMatches = [...pdfText.matchAll(_emailRe)];
+              // Extraer emails con regex más flexible
+              const emailFlexRe = /[\w.\-+]+\s*@\s*[\w.\-]+\.\w{2,}/gi;
+              const emailMatches = [...pdfText.matchAll(emailFlexRe)];
               emailMatches.forEach(m=>{
-                const nie = m[0].split('@')[0].replace(/[.\-\s]/g,'').toLowerCase();
-                if(nie && nie.length>3) niesList.push(nie);
+                const email = m[0].replace(/\s/g, '').toLowerCase();
+                const nie = email.split('@')[0].replace(/[.\-]/g,'');
+                if(nie && nie.length >= 3) niesList.push(nie);
               });
-              console.log('[DETECT] Emails encontrados:', niesList.length, niesList.slice(0,3));
+              console.log('[DETECT] Emails encontrados:', niesList.length, niesList.slice(0,5));
 
               // Extraer nombres - múltiples estrategias
               // Estrategia 1: Nombres en MAYÚSCULAS (formato común de Meet)
@@ -2905,7 +2910,7 @@ function importarMeet(input){
               let capsMatches = [...pdfText.matchAll(capsRe)];
               capsMatches.forEach(m=>{
                 const name = m[1].trim();
-                if(name.length > 4 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO|ASISTENCIA|PARTICIPANTE)/i.test(name)){
+                if(name.length > 4 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO|ASISTENCIA|PARTICIPANTE|ELECTR)/i.test(name)){
                   namesList.push(name);
                 }
               });
@@ -2927,8 +2932,12 @@ function importarMeet(input){
             }
           }
 
-          console.log('[DETECT] Total NIEs:', niesList.length, '| Total nombres:', namesList.length);
+          console.log('[DETECT] Total NIEs del PDF:', niesList.length, niesList.slice(0,10));
+          console.log('[DETECT] Total nombres del PDF:', namesList.length);
           console.log('[DETECT] Estudiantes en BD:', allStudents.length);
+          // Mostrar NIEs de la BD para comparar
+          const estudiantesConNIE = allStudents.filter(s=>s.nie).slice(0,5);
+          console.log('[DETECT] Muestra NIEs en BD:', estudiantesConNIE.map(s=>({nie:s.nie, nombre:s.nombre})));
 
           // ══════════════════════════════════════════════════════════════════
           // SISTEMA DE VOTACIÓN PARA DETECCIÓN DE SECCIÓN
@@ -2940,18 +2949,29 @@ function importarMeet(input){
           niesList.forEach(nie=>{
             const norm = nie.replace(/[.\-\s]/g,'').toLowerCase();
             allStudents.forEach(s=>{
-              if(!s.nie || matchedStudents.has(s.id)) return;
-              const snie = s.nie.replace(/[.\-\s]/g,'').toLowerCase();
-              // Match flexible
-              const isMatch = snie===norm ||
-                     snie.startsWith(norm) || norm.startsWith(snie) ||
-                     (norm.length >= 5 && snie.includes(norm)) ||
-                     (snie.length >= 5 && norm.includes(snie));
-              if(isMatch){
+              if(matchedStudents.has(s.id)) return;
+              // Comparar con NIE si existe
+              if(s.nie){
+                const snie = s.nie.replace(/[.\-\s]/g,'').toLowerCase();
+                const isMatch = snie===norm ||
+                       snie.startsWith(norm) || norm.startsWith(snie) ||
+                       (norm.length >= 4 && snie.includes(norm)) ||
+                       (snie.length >= 4 && norm.includes(snie));
+                if(isMatch){
+                  matchedStudents.add(s.id);
+                  const k = normGS(s.grado)+'|||'+normGS(s.seccion);
+                  votes[k] = (votes[k]||0) + 2;
+                  console.log('[DETECT] ✓ Match NIE:', norm, '↔', snie, '→', s.nombre);
+                  return;
+                }
+              }
+              // Si no tiene NIE, comparar con el nombre (puede que el NIE esté en el nombre)
+              const nombreNorm = s.nombre.replace(/[.\-\s]/g,'').toLowerCase();
+              if(norm.length >= 6 && nombreNorm.includes(norm)){
                 matchedStudents.add(s.id);
                 const k = normGS(s.grado)+'|||'+normGS(s.seccion);
-                votes[k] = (votes[k]||0) + 2;
-                console.log('[DETECT] Match NIE:', nie, '→', s.nombre, s.grado, s.seccion);
+                votes[k] = (votes[k]||0) + 1;
+                console.log('[DETECT] ✓ Match NIE en nombre:', norm, '→', s.nombre);
               }
             });
           });
@@ -2982,9 +3002,9 @@ function importarMeet(input){
           });
 
           const totalVotos = matchedStudents.size;
-          console.log('[DETECT] Votos totales:', totalVotos, '| Por sección:', votes);
+          console.log('[DETECT] Matches encontrados:', totalVotos, '| Por sección:', votes);
 
-          // Solo necesita 1 match para detectar (antes era 2)
+          // Solo necesita 1 match para detectar
           if(Object.keys(votes).length > 0 && totalVotos >= 1){
             const bestKey = Object.keys(votes).sort((a,b)=>votes[b]-votes[a])[0];
             const bestVotes = votes[bestKey];
@@ -3002,12 +3022,20 @@ function importarMeet(input){
                 {grado: canon?canon.grado:g, seccion: canon?canon.seccion:s, votes:totalVotos, total:niesList.length+namesList.length, confianza}
               );
               _meetSyncSel();
-              console.log('[DETECT] ✓ SECCIÓN DETECTADA:', canon?canon.grado+' '+canon.seccion:'?', '| Confianza:', confianza+'%');
+              const secName = canon ? canon.grado+' "'+canon.seccion+'"' : g+' "'+s+'"';
+              toast('🎯 Sección detectada: '+secName+' ('+totalVotos+' alumnos)');
+              console.log('[DETECT] ✓ SECCIÓN DETECTADA:', secName, '| Confianza:', confianza+'%');
             }
           } else {
-            console.log('[DETECT] ✗ No se pudo detectar sección automáticamente');
+            console.log('[DETECT] ✗ No se detectó sección. NIEs PDF:', niesList.slice(0,5), '| Estudiantes BD:', allStudents.length);
+            if(niesList.length > 0 && allStudents.length > 0){
+              toast('⚠️ No se detectó sección. Verificá que los NIEs coincidan.');
+            }
           }
-        } catch(err){ console.error('[DETECT] Error general:', err); }
+        } catch(err){
+          console.error('[DETECT] Error:', err);
+          toast('❌ Error al detectar sección');
+        }
       };
       reader.readAsArrayBuffer(file);
     }
