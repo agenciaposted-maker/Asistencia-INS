@@ -2830,6 +2830,7 @@ function importarMeet(input){
         '<input class="form-control" type="number" id="meet-minutos" value="45" min="1" max="180">'+
         '<span style="font-size:11px;color:var(--gray);margin-top:3px;display:block">Si la duración es menor se marcará como Tarde. Si no aparece en el archivo, Ausente.</span>'+
       '</div>'+
+      '<div id="meet-debug" style="grid-column:1/-1;background:#f0f0f0;border-radius:8px;padding:10px;font-size:11px;font-family:monospace;max-height:150px;overflow:auto;display:none"></div>'+
     '</div>',
     '<button class="btn btn-outline" onclick="closeModal()">Cancelar</button>'+
     '<button class="btn btn-primary" onclick="procesarMeetArchivo()">📥 Importar</button>'
@@ -2840,7 +2841,11 @@ function importarMeet(input){
     document.getElementById('meet-materia')?.focus();
     _meetSyncSel(); // sincronizar hidden inputs con valor inicial
 
+    const debugEl = document.getElementById('meet-debug');
+    function dbg(msg){ if(debugEl){ debugEl.style.display='block'; debugEl.innerHTML += msg + '<br>'; debugEl.scrollTop=debugEl.scrollHeight; } console.log('[DETECT]', msg); }
+
     if(secciones.length > 0 && file){
+      dbg('📂 Leyendo archivo: ' + file.name);
       const reader = new FileReader();
       reader.onerror=()=>toast('❌ Error al leer archivo');
       reader.onload = async e=>{
@@ -2880,7 +2885,7 @@ function importarMeet(input){
           } else {
             // PDF: usar pdf.js para extraer texto y encontrar emails y nombres
             try{
-              console.log('[DETECT] Iniciando extracción de PDF...');
+              dbg('📄 Extrayendo texto del PDF...');
               const pdfDoc = await pdfjsLib.getDocument({data: e.target.result}).promise;
               let pdfText = '';
               for(let pi=1; pi<=pdfDoc.numPages; pi++){
@@ -2888,12 +2893,10 @@ function importarMeet(input){
                 const tc = await page.getTextContent();
                 pdfText += tc.items.map(it=>it.str).join(' ') + ' ';
               }
-              // Limpiar texto: normalizar espacios alrededor de @
               pdfText = pdfText.replace(/\s*@\s*/g, '@').replace(/\s+/g, ' ');
-              console.log('[DETECT] Texto PDF extraído, longitud:', pdfText.length);
-              console.log('[DETECT] Muestra texto:', pdfText.substring(0, 500));
+              dbg('✓ Texto extraído: ' + pdfText.length + ' caracteres');
 
-              // Extraer emails con regex más flexible
+              // Extraer emails
               const emailFlexRe = /[\w.\-+]+\s*@\s*[\w.\-]+\.\w{2,}/gi;
               const emailMatches = [...pdfText.matchAll(emailFlexRe)];
               emailMatches.forEach(m=>{
@@ -2901,107 +2904,79 @@ function importarMeet(input){
                 const nie = email.split('@')[0].replace(/[.\-]/g,'');
                 if(nie && nie.length >= 3) niesList.push(nie);
               });
-              console.log('[DETECT] Emails encontrados:', niesList.length, niesList.slice(0,5));
+              dbg('📧 NIEs del PDF: ' + niesList.length + ' → ' + niesList.slice(0,5).join(', '));
 
-              // Extraer nombres - múltiples estrategias
-              // Estrategia 1: Nombres en MAYÚSCULAS (formato común de Meet)
+              // Extraer nombres en MAYÚSCULAS
               const capsRe = /([A-ZÁÉÍÓÚÑÜ]{2,}(?:\s+[A-ZÁÉÍÓÚÑÜ]{2,}){1,5})/g;
-              let capsMatches = [...pdfText.matchAll(capsRe)];
-              capsMatches.forEach(m=>{
+              [...pdfText.matchAll(capsRe)].forEach(m=>{
                 const name = m[1].trim();
                 if(name.length > 4 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO|ASISTENCIA|PARTICIPANTE|ELECTR)/i.test(name)){
                   namesList.push(name);
                 }
               });
-
-              // Estrategia 2: Nombres en formato Title Case (Primera Mayúscula)
-              const titleRe = /([A-ZÁÉÍÓÚÑÜ][a-záéíóúñü]+(?:\s+[A-ZÁÉÍÓÚÑÜ][a-záéíóúñü]+){1,4})/g;
-              let titleMatches = [...pdfText.matchAll(titleRe)];
-              titleMatches.forEach(m=>{
-                const name = m[1].trim().toUpperCase();
-                if(name.length > 4 && !namesList.includes(name) &&
-                   !/^(Nombre|Apellido|Correo|Email|Duraci|Hora|Tiempo)/i.test(m[1])){
-                  namesList.push(name);
-                }
-              });
-
-              console.log('[DETECT] Nombres encontrados:', namesList.length, namesList.slice(0,5));
+              dbg('👤 Nombres del PDF: ' + namesList.length);
             } catch(pdfErr){
-              console.error('[DETECT] Error PDF:', pdfErr);
+              dbg('❌ Error PDF: ' + pdfErr.message);
             }
           }
 
-          console.log('[DETECT] Total NIEs del PDF:', niesList.length, niesList.slice(0,10));
-          console.log('[DETECT] Total nombres del PDF:', namesList.length);
-          console.log('[DETECT] Estudiantes en BD:', allStudents.length);
-          // Mostrar NIEs de la BD para comparar
-          const estudiantesConNIE = allStudents.filter(s=>s.nie).slice(0,5);
-          console.log('[DETECT] Muestra NIEs en BD:', estudiantesConNIE.map(s=>({nie:s.nie, nombre:s.nombre})));
+          dbg('📊 Estudiantes en BD: ' + allStudents.length);
+          const estudiantesConNIE = allStudents.filter(s=>s.nie);
+          dbg('🔢 Estudiantes con NIE: ' + estudiantesConNIE.length);
+          if(estudiantesConNIE.length > 0){
+            dbg('Muestra NIEs BD: ' + estudiantesConNIE.slice(0,3).map(s=>s.nie).join(', '));
+          } else {
+            dbg('⚠️ ¡Ningún estudiante tiene NIE cargado!');
+          }
 
           // ══════════════════════════════════════════════════════════════════
           // SISTEMA DE VOTACIÓN PARA DETECCIÓN DE SECCIÓN
           // ══════════════════════════════════════════════════════════════════
+          dbg('🔍 Buscando coincidencias...');
           const votes = {};
           const matchedStudents = new Set();
+          let matchLog = [];
 
-          // PASO 1: Votos por NIE (alta confianza - peso 2)
+          // PASO 1: Votos por NIE
           niesList.forEach(nie=>{
             const norm = nie.replace(/[.\-\s]/g,'').toLowerCase();
-            allStudents.forEach(s=>{
-              if(matchedStudents.has(s.id)) return;
-              // Comparar con NIE si existe
+            for(const s of allStudents){
+              if(matchedStudents.has(s.id)) continue;
               if(s.nie){
                 const snie = s.nie.replace(/[.\-\s]/g,'').toLowerCase();
-                const isMatch = snie===norm ||
-                       snie.startsWith(norm) || norm.startsWith(snie) ||
-                       (norm.length >= 4 && snie.includes(norm)) ||
-                       (snie.length >= 4 && norm.includes(snie));
+                const isMatch = snie===norm || snie.startsWith(norm) || norm.startsWith(snie) ||
+                       (norm.length >= 4 && snie.includes(norm)) || (snie.length >= 4 && norm.includes(snie));
                 if(isMatch){
                   matchedStudents.add(s.id);
                   const k = normGS(s.grado)+'|||'+normGS(s.seccion);
                   votes[k] = (votes[k]||0) + 2;
-                  console.log('[DETECT] ✓ Match NIE:', norm, '↔', snie, '→', s.nombre);
-                  return;
+                  matchLog.push('NIE ' + norm + ' → ' + s.nombre.split(' ')[0]);
+                  break;
                 }
               }
-              // Si no tiene NIE, comparar con el nombre (puede que el NIE esté en el nombre)
-              const nombreNorm = s.nombre.replace(/[.\-\s]/g,'').toLowerCase();
-              if(norm.length >= 6 && nombreNorm.includes(norm)){
-                matchedStudents.add(s.id);
-                const k = normGS(s.grado)+'|||'+normGS(s.seccion);
-                votes[k] = (votes[k]||0) + 1;
-                console.log('[DETECT] ✓ Match NIE en nombre:', norm, '→', s.nombre);
-              }
-            });
+            }
           });
 
-          // PASO 2: Votos por nombre (peso 1)
-          const scoreThreshold = 0.45; // Más permisivo
+          // PASO 2: Votos por nombre
+          const scoreThreshold = 0.45;
           namesList.forEach(pname=>{
             let bestMatch = null, bestScore = 0;
             allStudents.forEach(s=>{
               if(matchedStudents.has(s.id)) return;
-              let score = 0;
-              if(typeof meetNombreScore === 'function'){
-                score = meetNombreScore(s.nombre, pname);
-              } else {
-                const pn = normalizeStr(pname).split(' ').filter(w=>w.length>2);
-                const sn = normalizeStr(s.nombre).split(' ').filter(w=>w.length>2);
-                const shared = pn.filter(w=>sn.includes(w)).length;
-                score = shared / Math.max(pn.length, sn.length, 1);
-              }
+              const score = typeof meetNombreScore === 'function' ? meetNombreScore(s.nombre, pname) : 0;
               if(score > bestScore){ bestScore = score; bestMatch = s; }
             });
             if(bestMatch && bestScore >= scoreThreshold){
               matchedStudents.add(bestMatch.id);
               const k = normGS(bestMatch.grado)+'|||'+normGS(bestMatch.seccion);
               votes[k] = (votes[k]||0) + 1;
-              console.log('[DETECT] Match nombre:', pname, '→', bestMatch.nombre, '('+Math.round(bestScore*100)+'%)');
+              matchLog.push('Nombre ' + pname.split(' ')[0] + ' → ' + bestMatch.nombre.split(' ')[0]);
             }
           });
 
           const totalVotos = matchedStudents.size;
-          console.log('[DETECT] Matches encontrados:', totalVotos, '| Por sección:', votes);
+          dbg('✓ Matches: ' + totalVotos);
+          if(matchLog.length > 0) dbg(matchLog.slice(0,5).join(', '));
 
           // Solo necesita 1 match para detectar
           if(Object.keys(votes).length > 0 && totalVotos >= 1){
@@ -3013,6 +2988,9 @@ function importarMeet(input){
             ).length;
             const confianza = Math.round(Math.min(bestVotes / Math.max(studentsInSection * 0.2, 1), 1) * 100);
             const canon = secciones.find(sec=>sec.key===bestKey);
+            const secName = canon ? canon.grado+' "'+canon.seccion+'"' : g+' "'+s+'"';
+
+            dbg('🎯 <b style="color:green">DETECTADO: ' + secName + '</b>');
 
             const container = document.getElementById('meet-seccion-container');
             if(container){
@@ -3021,19 +2999,22 @@ function importarMeet(input){
                 {grado: canon?canon.grado:g, seccion: canon?canon.seccion:s, votes:totalVotos, total:niesList.length+namesList.length, confianza}
               );
               _meetSyncSel();
-              const secName = canon ? canon.grado+' "'+canon.seccion+'"' : g+' "'+s+'"';
-              toast('🎯 Sección detectada: '+secName+' ('+totalVotos+' alumnos)');
-              console.log('[DETECT] ✓ SECCIÓN DETECTADA:', secName, '| Confianza:', confianza+'%');
+              toast('🎯 Sección detectada: '+secName);
             }
           } else {
-            console.log('[DETECT] ✗ No se detectó sección. NIEs PDF:', niesList.slice(0,5), '| Estudiantes BD:', allStudents.length);
-            if(niesList.length > 0 && allStudents.length > 0){
-              toast('⚠️ No se detectó sección. Verificá que los NIEs coincidan.');
+            dbg('❌ <b style="color:red">No se detectó sección</b>');
+            if(niesList.length === 0){
+              dbg('→ No se encontraron emails en el PDF');
+            } else if(estudiantesConNIE.length === 0){
+              dbg('→ Los estudiantes no tienen NIE cargado en la BD');
+            } else {
+              dbg('→ Los NIEs del PDF no coinciden con la BD');
+              dbg('PDF: ' + niesList.slice(0,3).join(', '));
+              dbg('BD: ' + estudiantesConNIE.slice(0,3).map(s=>s.nie).join(', '));
             }
           }
         } catch(err){
-          console.error('[DETECT] Error:', err);
-          toast('❌ Error al detectar sección');
+          dbg('❌ Error: ' + err.message);
         }
       };
       reader.readAsArrayBuffer(file);
