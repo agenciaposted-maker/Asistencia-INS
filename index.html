@@ -2886,7 +2886,12 @@ function importarMeet(input){
             // PDF: usar pdf.js para extraer texto y encontrar emails y nombres
             try{
               dbg('📄 Extrayendo texto del PDF...');
-              const pdfDoc = await pdfjsLib.getDocument({data: e.target.result}).promise;
+              // Inicializar worker de pdf.js si no está configurado
+              if(typeof pdfjsLib !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc){
+                pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+                // Usar fake worker (sin web worker separado)
+              }
+              const pdfDoc = await pdfjsLib.getDocument({data: e.target.result, disableWorker: true}).promise;
               let pdfText = '';
               for(let pi=1; pi<=pdfDoc.numPages; pi++){
                 const page = await pdfDoc.getPage(pi);
