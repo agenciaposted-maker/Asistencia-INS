@@ -1026,6 +1026,43 @@ function normalizeStr(s){
     .normalize('NFD').replace(/[\u0300-\u036f]/g,'');
 }
 // Normaliza grado y sección para comparaciones tolerantes a mayúsculas/espacios
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER: Reconstruir texto fragmentado del PDF (v1.1.0)
+// El PDF.js a veces separa caracteres: "VIC T OR" → "VICTOR"
+// ══════════════════════════════════════════════════════════════════════════════
+function _reconstructFragmentedPdfText(text) {
+  let result = text;
+
+  // Paso 1: Juntar letras mayúsculas sueltas separadas por espacios
+  // Patrón: secuencias como "V I C T O R" o "M A R I O"
+  result = result.replace(/\b([A-ZÁÉÍÓÚÑÜ])(?:\s+([A-ZÁÉÍÓÚÑÜ]))+\b/g, (match) => {
+    const letters = match.replace(/\s+/g, '');
+    const spaces = (match.match(/\s+/g) || []).length;
+    // Si hay casi tantos espacios como letras, es fragmentación
+    if (spaces >= letters.length - 1 && letters.length >= 2) {
+      return letters;
+    }
+    return match;
+  });
+
+  // Paso 2: Reconstruir palabras con letras sueltas intercaladas
+  // Ej: "MAR IO" → "MARIO", "JON A THAN" → "JONATHAN"
+  result = result.replace(/\b([A-ZÁÉÍÓÚÑÜ]{2,})\s+([A-ZÁÉÍÓÚÑÜ])\s+([A-ZÁÉÍÓÚÑÜ]{2,})\b/g, (match, p1, mid, p2) => {
+    // Si la letra del medio conecta las dos partes, unirlas
+    return p1 + mid + p2;
+  });
+
+  // Paso 3: Limpiar espacios múltiples
+  result = result.replace(/[ \t]+/g, ' ');
+
+  // Paso 4: Reparar emails fragmentados
+  result = result.replace(/(\w)\s*@\s*(\w)/g, '$1@$2');
+  result = result.replace(/\s+\.\s+/g, '.');
+
+  return result;
+}
+
 function normGS(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,' '); }
 function normName(s){ return String(s||"").trim().toLowerCase().replace(/\s+/g," "); }
 function sanitizeSheetName(s){ return String(s||"").replace(/[\/?*[\]:]/g,"").slice(0,31); }
@@ -2900,9 +2937,24 @@ function importarMeet(input){
               for(let pi=1; pi<=pdfDoc.numPages; pi++){
                 const page = await pdfDoc.getPage(pi);
                 const tc = await page.getTextContent();
-                pdfText += tc.items.map(it=>it.str).join(' ') + ' ';
+                // v1.1.0: Agrupar items por fila (misma Y) para mejor reconstrucción
+                const rows = {};
+                tc.items.forEach(item => {
+                  const y = Math.round(item.transform[5] / 3) * 3;
+                  const x = item.transform[4];
+                  if(!rows[y]) rows[y] = [];
+                  rows[y].push({x, str: item.str});
+                });
+                const sortedYs = Object.keys(rows).map(Number).sort((a,b)=>b-a);
+                sortedYs.forEach(y => {
+                  const rowItems = rows[y].sort((a,b)=>a.x-b.x);
+                  pdfText += rowItems.map(it=>it.str).join(' ') + '\n';
+                });
               }
-              pdfText = pdfText.replace(/\s*@\s*/g, '@').replace(/\s+/g, ' ');
+              // v1.1.0: Reconstruir texto fragmentado
+              pdfText = typeof _reconstructFragmentedPdfText === 'function'
+                ? _reconstructFragmentedPdfText(pdfText)
+                : pdfText.replace(/\s*@\s*/g, '@').replace(/\s+/g, ' ');
               dbg('✓ Texto extraído: ' + pdfText.length + ' caracteres');
 
               // Extraer emails
@@ -2915,10 +2967,10 @@ function importarMeet(input){
               });
               dbg('📧 NIEs del PDF: ' + niesList.length + ' → ' + niesList.slice(0,5).join(', '));
 
-              // Extraer nombres en MAYÚSCULAS
-              const capsRe = /([A-ZÁÉÍÓÚÑÜ]{2,}(?:\s+[A-ZÁÉÍÓÚÑÜ]{2,}){1,5})/g;
-              [...pdfText.matchAll(capsRe)].forEach(m=>{
-                const name = m[1].trim();
+              // Extraer nombres (secuencias de palabras)
+              const nameFlexRe = /([a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]{2,}(?:\s+[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]{2,}){1,5})/g;
+              [...pdfText.matchAll(nameFlexRe)].forEach(m=>{
+                const name = m[1].trim().toUpperCase();
                 if(name.length > 4 && !/^(NOMBRE|APELLIDO|CORREO|EMAIL|DURACI|HORA|TIEMPO|ASISTENCIA|PARTICIPANTE|ELECTR)/i.test(name)){
                   namesList.push(name);
                 }
@@ -3158,8 +3210,24 @@ async function procesarMeetArchivo(){
         for(let i=1; i<=pdf.numPages; i++){
           const page = await pdf.getPage(i);
           const tc = await page.getTextContent();
-          allText += tc.items.map(item=>item.str).join(' ') + '\n';
+          // v1.1.0: Agrupar items por fila para mejor reconstrucción
+          const rows = {};
+          tc.items.forEach(item => {
+            const y = Math.round(item.transform[5] / 3) * 3;
+            const x = item.transform[4];
+            if(!rows[y]) rows[y] = [];
+            rows[y].push({x, str: item.str});
+          });
+          const sortedYs = Object.keys(rows).map(Number).sort((a,b)=>b-a);
+          sortedYs.forEach(y => {
+            const rowItems = rows[y].sort((a,b)=>a.x-b.x);
+            allText += rowItems.map(it=>it.str).join(' ') + '\n';
+          });
         }
+        // v1.1.0: Reconstruir texto fragmentado
+        allText = typeof _reconstructFragmentedPdfText === 'function'
+          ? _reconstructFragmentedPdfText(allText)
+          : allText;
         const _dupPdf = buscarSesionExistente(fecha, materia, grado, seccion);
         if(_dupPdf){
           // parseMeetPDFText llama internamente a parseMeetParticipants
@@ -3227,6 +3295,16 @@ function parseMeetPDFText(text, fecha, materia, grado, seccion, minMin){
 
   // Preprocesar texto: normalizar saltos de línea
   let cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  
+  // REPARACIONES PARA PDF.JS
+  // 1. Reparar emails fragmentados por el motor PDF (ej. "juan  @  gmail . com")
+  cleanText = cleanText.replace(/(\w)\s+@\s+(\w)/g, '$1@$2');
+  cleanText = cleanText.replace(/@\s+/g, '@');
+  cleanText = cleanText.replace(/\s+@/g, '@');
+  
+  // 2. Limpiar espacios excesivos entre palabras (máximo 2) para no confundir al tabular
+  cleanText = cleanText.replace(/\s{3,}/g, '  ');
+  
   const rawLines = cleanText.split(/\n/).map(l=>l.trim()).filter(Boolean);
   const participants = [];
   let parseMethod = 'unknown';
@@ -3254,13 +3332,19 @@ function parseMeetPDFText(text, fecha, materia, grado, seccion, minMin){
         .trim();
 
       // Buscar nombre en MAYÚSCULAS (formato común de Meet)
-      const capsMatch = namePart.match(/([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{4,})/);
-      if(capsMatch && capsMatch[1].trim().length > 4){
-        namePart = capsMatch[1].trim();
+      // Puede haber nombres y apellidos en columnas separadas. Agrupar múltiples matches seguidos.
+      const allCapsParts = [...namePart.matchAll(/([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{2,})/g)];
+      if (allCapsParts.length > 0) {
+        namePart = allCapsParts.map(m => m[1].trim()).join(' ');
       } else {
-        // Tomar palabras que parezcan nombre (últimas 2-4 palabras con letras)
-        const words = namePart.split(/\s+/).filter(w=>w.length>1 && /^[a-záéíóúñA-ZÁÉÍÓÚÑ]+$/i.test(w));
-        namePart = words.slice(-4).join(' ');
+        const capsMatch = namePart.match(/([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s]{4,})/);
+        if(capsMatch && capsMatch[1].trim().length > 4){
+          namePart = capsMatch[1].trim();
+        } else {
+          // Tomar palabras que parezcan nombre (últimas 2-6 palabras con letras)
+          const words = namePart.split(/\s+/).filter(w=>w.length>1 && /^[a-záéíóúñA-ZÁÉÍÓÚÑ]+$/i.test(w));
+          namePart = words.slice(-6).join(' ');
+        }
       }
 
       // Extraer duración: buscar después del email primero
@@ -3383,20 +3467,32 @@ function parseMeetPDFText(text, fecha, materia, grado, seccion, minMin){
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // MÉTODO 4: Último recurso - nombres en MAYÚSCULAS con match a estudiantes
+  // MÉTODO 4: Último recurso - secuencias de nombres con match a estudiantes
   // ══════════════════════════════════════════════════════════════════════════
   if(!participants.length){
-    parseMethod = 'uppercase-names';
-    const capsRe = /([A-ZÁÉÍÓÚÑ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ]{2,}){1,5})/g;
-    const capsMatches = [...cleanText.matchAll(capsRe)];
+    parseMethod = 'fallback-names';
+    const nameFlexRe = /([a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]{2,}(?:\s+[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ]{2,}){1,5})/g;
+    const capsMatches = [...cleanText.matchAll(nameFlexRe)];
     const seenNames = new Set();
+    
+    // Agrupar fragments para tablas (Nombre en col1, Apellido en col2)
+    const groupedMatches = [];
+    for(let i=0; i<capsMatches.length; i++) {
+        let name = capsMatches[i][1].trim();
+        let idx = capsMatches[i].index;
+        if(i < capsMatches.length - 1 && capsMatches[i+1].index - (idx + name.length) < 50 && !tableHdrRe.test(capsMatches[i+1][1])) {
+            name += ' ' + capsMatches[i+1][1].trim();
+            i++; 
+        }
+        groupedMatches.push({name, index: idx});
+    }
 
-    capsMatches.forEach(m => {
-      const name = m[1].trim();
+    groupedMatches.forEach(m => {
+      const name = m.name;
       const nameNorm = normalizeStr(name);
       if(seenNames.has(nameNorm) || name.length < 5 || tableHdrRe.test(name)) return;
 
-      const matchStudent = students.find(s => meetNombreScore(s.nombre, name) >= 0.5);
+      const matchStudent = students.find(s => meetNombreScore(s.nombre, name) >= 0.45);
       if(matchStudent){
         seenNames.add(nameNorm);
         const nameIdx = m.index;
@@ -3432,40 +3528,74 @@ function parseMeetPDFText(text, fecha, materia, grado, seccion, minMin){
 
 // ── Utilidad: score de similitud entre nombre del sistema y nombre del Meet ──
 // ══════════════════════════════════════════════════════════════════════════════
-// SCORING DE SIMILITUD MEJORADO PARA MATCHING DE NOMBRES
-// Retorna 0..1. Tolera: orden invertido, tildes, errores tipográficos, iniciales
+// SCORING DE SIMILITUD MEJORADO v1.1.0 - PARA MATCHING DE NOMBRES
+// Retorna 0..1. Tolera: orden invertido, tildes, errores tipográficos, iniciales,
+// fragmentación de PDF, variaciones de nombres compuestos
 // ══════════════════════════════════════════════════════════════════════════════
 function meetNombreScore(nombreSistema, nombreMeet){
-  const sN = normalizeStr(nombreSistema).replace(/[,\.]/g,' ').replace(/\s+/g,' ').trim();
-  const pN = normalizeStr(nombreMeet).replace(/[,\.]/g,' ').replace(/\s+/g,' ').trim();
+  // Normalización robusta
+  function normalizeName(s) {
+    return String(s||'').toLowerCase().trim()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+      .replace(/[,\.\-_]/g,' ')
+      .replace(/\s+/g,' ')
+      .trim();
+  }
+
+  const sN = normalizeName(nombreSistema);
+  const pN = normalizeName(nombreMeet);
   if(!sN || !pN) return 0;
   if(sN === pN) return 1.0;
 
-  // Palabras significativas (>2 chars) de cada lado
-  const sWords = sN.split(' ').filter(w=>w.length>2);
-  const pWords = pN.split(' ').filter(w=>w.length>2);
+  // Palabras significativas (>1 char para capturar iniciales también)
+  const sWords = sN.split(' ').filter(w=>w.length>1);
+  const pWords = pN.split(' ').filter(w=>w.length>1);
   if(!sWords.length || !pWords.length) return 0;
 
-  // Función de similitud entre dos palabras (tolerante a errores)
+  // Distancia de Levenshtein optimizada
+  function levenshtein(a, b) {
+    if(a === b) return 0;
+    if(a.length === 0) return b.length;
+    if(b.length === 0) return a.length;
+
+    const matrix = [];
+    for(let i = 0; i <= b.length; i++) matrix[i] = [i];
+    for(let j = 0; j <= a.length; j++) matrix[0][j] = j;
+
+    for(let i = 1; i <= b.length; i++) {
+      for(let j = 1; j <= a.length; j++) {
+        const cost = a[j-1] === b[i-1] ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i-1][j] + 1,
+          matrix[i][j-1] + 1,
+          matrix[i-1][j-1] + cost
+        );
+      }
+    }
+    return matrix[b.length][a.length];
+  }
+
+  // Similitud entre dos palabras usando Levenshtein normalizado
   function wordSimilarity(a, b){
     if(a === b) return 1.0;
     if(a.length < 2 || b.length < 2) return 0;
-    // Una es prefijo de la otra (ej: "JOSE" vs "JOSEFINA")
-    if(a.startsWith(b) || b.startsWith(a)) return 0.85;
-    // Similitud por caracteres comunes (tipo Dice coefficient)
-    const setA = new Set(a.split(''));
-    const setB = new Set(b.split(''));
-    let common = 0;
-    setA.forEach(c => { if(setB.has(c)) common++; });
-    const dice = (2 * common) / (setA.size + setB.size);
-    // Penalizar si las longitudes son muy diferentes
-    const lenRatio = Math.min(a.length, b.length) / Math.max(a.length, b.length);
-    return dice * lenRatio * 0.7;
+
+    // Prefijos iguales (muy común en nombres truncados)
+    if(a.startsWith(b) || b.startsWith(a)) return 0.9;
+
+    // Levenshtein normalizado
+    const maxLen = Math.max(a.length, b.length);
+    const dist = levenshtein(a, b);
+    const similarity = 1 - (dist / maxLen);
+
+    // Umbral mínimo para considerar match
+    return similarity >= 0.6 ? similarity : 0;
   }
 
-  // Calcular matches entre palabras (cada palabra del sistema busca su mejor match en Meet)
+  // Matching greedy: cada palabra del sistema busca su mejor match
   let totalScore = 0;
-  let matchedPWords = new Set();
+  let matchedCount = 0;
+  const matchedPWords = new Set();
 
   sWords.forEach(sw => {
     let bestScore = 0, bestIdx = -1;
@@ -3477,23 +3607,42 @@ function meetNombreScore(nombreSistema, nombreMeet){
     if(bestScore >= 0.6 && bestIdx >= 0){
       matchedPWords.add(bestIdx);
       totalScore += bestScore;
+      matchedCount++;
     }
   });
 
-  // Score final: promedio de matches encontrados vs palabras esperadas
-  const expectedMatches = Math.min(sWords.length, pWords.length);
-  const baseScore = totalScore / expectedMatches;
+  // Score base: promedio de matches encontrados
+  const minWords = Math.min(sWords.length, pWords.length);
 
-  // Bonus si el orden es igual (primer nombre igual = probable mismo estudiante)
-  let orderBonus = 0;
-  if(sWords[0] === pWords[0]) orderBonus = 0.1;
-  else if(sWords[0] === pWords[pWords.length-1] || sWords[sWords.length-1] === pWords[0]) orderBonus = 0.05;
+  if(matchedCount === 0) return 0;
 
-  // Penalización si hay muchas palabras extra en uno de los lados
-  const extraWordsPenalty = Math.abs(sWords.length - pWords.length) * 0.05;
+  const baseScore = totalScore / minWords;
 
-  return Math.min(1.0, Math.max(0, baseScore + orderBonus - extraWordsPenalty));
+  // Bonus/penalizaciones
+  let bonus = 0;
+
+  // Bonus si el primer nombre coincide
+  if(sWords[0] === pWords[0]) bonus += 0.15;
+  else if(wordSimilarity(sWords[0], pWords[0]) >= 0.8) bonus += 0.1;
+
+  // Bonus si coinciden apellidos
+  if(sWords.length > 1 && pWords.length > 1){
+    const sLast = sWords[sWords.length-1];
+    const pLast = pWords[pWords.length-1];
+    if(sLast === pLast) bonus += 0.1;
+    else if(wordSimilarity(sLast, pLast) >= 0.8) bonus += 0.05;
+  }
+
+  // Penalización suave por diferencia en cantidad de palabras
+  const wordDiffPenalty = Math.abs(sWords.length - pWords.length) * 0.03;
+
+  // Bonus por cobertura alta
+  const coverage = matchedCount / minWords;
+  const coverageBonus = coverage >= 0.8 ? 0.05 : 0;
+
+  return Math.min(1.0, Math.max(0, baseScore + bonus + coverageBonus - wordDiffPenalty));
 }
+
 
 // ── Shared: match participants list to students and create session ──
 
