@@ -1,0 +1,10 @@
+node_modules/
+asistencia-app/
+Nueva carpeta/
+ULTIMAS VERSIONES v1.2.0/
+memory/
+analyze_pdf.js
+extract_pdf.js
+test_pdf_auto.js
+*.log
+.claude/
